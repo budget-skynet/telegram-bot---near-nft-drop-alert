@@ -6,12 +6,12 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────────────────────────
 NEAR_RPC = "https://rpc.mainnet.near.org"
 PARAS_API = "https://api-v2-mainnet.paras.id"
 MINTBASE_API = "https://graph.mintbase.xyz"
@@ -20,14 +20,10 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
 # ── Low-level RPC helper ──────────────────────────────────────────────────────
 async def _rpc(method: str, params: dict) -> dict:
-    """
-    Generic async helper that sends a JSON-RPC request to the NEAR mainnet RPC
-    endpoint and returns the parsed response dict.
-    Raises RuntimeError on transport or RPC-level errors.
-    """
+    """Send a JSON-RPC request to the NEAR mainnet RPC endpoint."""
     payload = {
         "jsonrpc": "2.0",
-        "id": "nft-drop-bot",
+        "id": "nearbot",
         "method": method,
         "params": params,
     }
@@ -37,76 +33,134 @@ async def _rpc(method: str, params: dict) -> dict:
             json=payload,
             timeout=aiohttp.ClientTimeout(total=15),
         ) as resp:
-            if resp.status != 200:
-                raise RuntimeError(
-                    f"NEAR RPC HTTP error: {resp.status}"
-                )
+            resp.raise_for_status()
             data = await resp.json()
             if "error" in data:
-                raise RuntimeError(
-                    f"NEAR RPC error: {data['error'].get('message', data['error'])}"
-                )
+                raise ValueError(f"RPC error: {data['error']}")
             return data.get("result", {})
 
 
 # ── NEAR helper functions ─────────────────────────────────────────────────────
 
-async def get_nft_metadata(contract_id: str) -> dict:
+async def get_near_price() -> float:
+    """Fetch the current NEAR price in USD from CoinGecko."""
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {"ids": "near", "vs_currencies": "usd"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            url,
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            return data["near"]["usd"]
+
+
+async def get_paras_drops(limit: int = 5) -> list[dict]:
     """
-    Fetch NFT contract metadata (name, symbol, base_uri, icon …) via
-    `nft_metadata` view call on the given contract.
-    Returns a dict with keys: name, symbol, base_uri, icon, spec, reference.
+    Fetch the latest NFT collections / drops listed on Paras marketplace.
+    Returns a list of dicts with title, creator_id, floor_price, and url.
     """
-    import base64, json
+    url = f"{PARAS_API}/token-series"
+    params = {
+        "sort_by": "createdAt",
+        "order": "desc",
+        "__limit": limit,
+        "is_verified": "true",
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            url,
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            results = data.get("data", {}).get("results", [])
+            drops = []
+            for item in results:
+                metadata = item.get("metadata", {})
+                price_yocto = item.get("price")
+                floor_near = (
+                    round(int(price_yocto) / 1e24, 4)
+                    if price_yocto
+                    else None
+                )
+                drops.append(
+                    {
+                        "title": metadata.get("title", "Untitled"),
+                        "creator_id": item.get("creator_id", "unknown"),
+                        "floor_price": floor_near,
+                        "collection": item.get("metadata", {}).get(
+                            "collection", ""
+                        ),
+                        "url": (
+                            f"https://paras.id/token/"
+                            f"{item.get('contract_id', '')}::"
+                            f"{item.get('token_series_id', '')}"
+                        ),
+                    }
+                )
+            return drops
 
-    result = await _rpc(
-        "query",
-        {
-            "request_type": "call_function",
-            "finality": "final",
-            "account_id": contract_id,
-            "method_name": "nft_metadata",
-            "args_base64": base64.b64encode(b"{}").decode(),
-        },
-    )
-    raw = bytes(result["result"])
-    return json.loads(raw.decode())
 
-
-async def get_nft_supply(contract_id: str) -> int:
+async def get_mintbase_drops(limit: int = 5) -> list[dict]:
     """
-    Return the total minted supply for an NFT contract via `nft_total_supply`.
-    Returns an integer.
+    Query Mintbase GraphQL API for the most recently minted NFT stores/drops.
+    Returns a list of dicts with name, owner, base_uri, and url.
     """
-    import base64, json
-
-    result = await _rpc(
-        "query",
-        {
-            "request_type": "call_function",
-            "finality": "final",
-            "account_id": contract_id,
-            "method_name": "nft_total_supply",
-            "args_base64": base64.b64encode(b"{}").decode(),
-        },
-    )
-    raw = bytes(result["result"])
-    value = json.loads(raw.decode())
-    # Some contracts return a string, others an int
-    return int(value)
-
-
-async def get_account_nfts(contract_id: str, account_id: str) -> list:
+    query = """
+    query LatestStores($limit: Int!) {
+      nft_contracts(
+        order_by: {created_at: desc}
+        limit: $limit
+        where: {is_mintbase: {_eq: false}}
+      ) {
+        id
+        name
+        owner_id
+        base_uri
+        created_at
+      }
+    }
     """
-    Return the list of NFT tokens owned by *account_id* on *contract_id*
-    (first 10 tokens via `nft_tokens_for_owner`).
-    Each element is the raw token dict returned by the contract.
-    """
-    import base64, json
+    payload = {"query": query, "variables": {"limit": limit}}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            MINTBASE_API,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            stores = (
+                data.get("data", {}).get("nft_contracts", [])
+            )
+            drops = []
+            for s in stores:
+                drops.append(
+                    {
+                        "name": s.get("name") or s.get("id", "Unnamed"),
+                        "owner_id": s.get("owner_id", "unknown"),
+                        "base_uri": s.get("base_uri", ""),
+                        "created_at": s.get("created_at", ""),
+                        "url": f"https://www.mintbase.xyz/contract/{s.get('id','')}",
+                    }
+                )
+            return drops
 
-    args = json.dumps(
-        {"account_id": account_id, "from_index": "0", "limit": 10}
-    ).encode()
+
+async def get_account_nfts(account_id: str, contract_id: str) -> list[dict]:
+    """
+    Fetch NFTs owned by an account on a given NEP-171 contract via view call.
+    Returns a list of token metadata dicts.
+    """
+    import json, base64
+
+    args = json.dumps({"account_id": account_id, "from_index": "0", "limit": 10})
+    args_b64 = base64.b64encode(args.encode()).decode()
+
     result = await _rpc(
         "query",
         {
@@ -114,340 +168,217 @@ async def get_account_nfts(contract_id: str, account_id: str) -> list:
             "finality": "final",
             "account_id": contract_id,
             "method_name": "nft_tokens_for_owner",
-            "args_base64": base64.b64encode(args).decode(),
+            "args_base64": args_b64,
         },
     )
-    raw = bytes(result["result"])
-    return json.loads(raw.decode())
+    raw = bytes(result.get("result", []))
+    tokens = json.loads(raw.decode()) if raw else []
+    return tokens
 
 
-async def get_paras_drops() -> list:
-    """
-    Fetch the latest NFT drops listed on Paras marketplace.
-    Returns a list of dicts, each containing:
-        title, collection_id, creator_id, price, supply, start_date.
-    Falls back to an empty list on any network error so the bot stays alive.
-    """
-    try:
-        async with aiohttp.ClientSession() as session:
-            url = f"{PARAS_API}/drops"
-            params = {"__limit": 8, "__sort": "issued_at::-1"}
-            async with session.get(
-                url,
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json()
-                drops = data.get("data", {}).get("results", [])
-                formatted = []
-                for d in drops:
-                    formatted.append(
-                        {
-                            "title": d.get("metadata", {}).get("title", "Untitled"),
-                            "collection_id": d.get("collection_id", ""),
-                            "creator_id": d.get("creator_id", ""),
-                            "price": d.get("price", "N/A"),
-                            "supply": d.get("supply", "?"),
-                            "start_date": d.get("start_date", ""),
-                            "end_date": d.get("end_date", ""),
-                            "url": f"https://paras.id/drops/{d.get('id', '')}",
-                        }
-                    )
-                return formatted
-    except Exception as exc:
-        logger.warning("Paras API error: %s", exc)
-        return []
+async def get_near_block_info() -> dict:
+    """Return the latest NEAR block height and timestamp."""
+    result = await _rpc("block", {"finality": "final"})
+    header = result.get("header", {})
+    ts_ns = header.get("timestamp", 0)
+    ts_s = ts_ns / 1e9
+    from datetime import datetime, timezone
 
-
-async def get_mintbase_recent_drops() -> list:
-    """
-    Fetch recently deployed NFT stores / drop contracts from Mintbase
-    via its public GraphQL endpoint.
-    Returns a list of dicts with keys: name, id, owner, created_at.
-    Falls back to an empty list on any error.
-    """
-    query = """
-    {
-      nft_contracts(
-        order_by: {created_at: desc}
-        limit: 6
-        where: {is_mintbase: {_eq: true}}
-      ) {
-        id
-        name
-        owner_id
-        created_at
-        tokens_aggregate {
-          aggregate { count }
-        }
-      }
+    dt = datetime.fromtimestamp(ts_s, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+    return {
+        "height": header.get("height"),
+        "timestamp": dt,
+        "hash": header.get("hash", ""),
     }
-    """
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                MINTBASE_API,
-                json={"query": query},
-                headers={"mb-api-key": "anon", "Content-Type": "application/json"},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json()
-                contracts = (
-                    data.get("data", {}).get("nft_contracts", [])
-                )
-                formatted = []
-                for c in contracts:
-                    minted = (
-                        c.get("tokens_aggregate", {})
-                        .get("aggregate", {})
-                        .get("count", 0)
-                    )
-                    formatted.append(
-                        {
-                            "name": c.get("name") or c.get("id", "Unknown"),
-                            "id": c.get("id", ""),
-                            "owner": c.get("owner_id", ""),
-                            "created_at": c.get("created_at", ""),
-                            "minted": minted,
-                            "url": f"https://mintbase.xyz/contract/{c.get('id', '')}",
-                        }
-                    )
-                return formatted
-    except Exception as exc:
-        logger.warning("Mintbase API error: %s", exc)
-        return []
 
 
-# ── /start & /help ────────────────────────────────────────────────────────────
+# ── /start and /help ──────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Welcome the user and give a quick overview of available commands.
-    """
-    user = update.effective_user
+    """Welcome message with command overview."""
     text = (
-        f"👋 *Welcome, {user.first_name}!*\n\n"
-        "🖼 *NEAR NFT Drop Alert Bot* keeps you ahead of every new drop "
-        "on the NEAR blockchain.\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔥 *Commands*\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "/drops — Latest NFT drops on Paras\n"
-        "/mintbase — Recent Mintbase stores\n"
-        "/nftinfo `<contract>` — NFT contract metadata\n"
-        "/supply `<contract>` — Total minted supply\n"
-        "/mynfts `<contract>` `<wallet>` — Your NFTs\n"
-        "/help — Show this message again\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "💡 _Example:_ `/nftinfo comic.paras.near`\n\n"
-        "🌐 Powered by [NEAR Protocol](https://near.org)"
+        "🟣 *NEAR NFT Drop Alert Bot*\n\n"
+        "Stay ahead of every drop on the NEAR blockchain!\n\n"
+        "📌 *Commands:*\n"
+        "  /drops — Latest NFT drops on *Paras*\n"
+        "  /mintbase — Latest stores on *Mintbase*\n"
+        "  /price — Current *NEAR* price in USD\n"
+        "  /chain — Live NEAR block info\n"
+        "  /mynfts `<account>` `<contract>` — Your NFTs on any contract\n"
+        "  /help — Show this message\n\n"
+        "Built with ❤️ for the NEAR ecosystem 🌈"
     )
-    await update.message.reply_text(
-        text,
-        parse_mode="Markdown",
-        disable_web_page_preview=True,
-    )
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Re-send the full command reference.
-    """
-    text = (
-        "📖 *NEAR NFT Drop Alert — Help*\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔥 *Available Commands*\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "🗓 */drops*\n"
-        "  Shows the 8 newest NFT drops on Paras marketplace with price, "
-        "supply and countdown.\n\n"
-        "🏪 */mintbase*\n"
-        "  Shows the 6 most recently created Mintbase NFT stores.\n\n"
-        "🔍 */nftinfo* `<contract_id>`\n"
-        "  Fetches on-chain metadata for any NEP-171 NFT contract.\n"
-        "  _Example:_ `/nftinfo comic.paras.near`\n\n"
-        "📊 */supply* `<contract_id>`\n"
-        "  Returns the total number of tokens minted so far.\n"
-        "  _Example:_ `/supply x.paras.near`\n\n"
-        "🎒 */mynfts* `<contract_id>` `<wallet.near>`\n"
-        "  Lists up to 10 NFTs you own in a specific collection.\n"
-        "  _Example:_ `/mynfts x.paras.near alice.near`\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "🌐 [NEAR Protocol](https://near.org) | "
-        "[Paras](https://paras.id) | "
-        "[Mintbase](https://mintbase.xyz)"
-    )
-    await update.message.reply_text(
-        text,
-        parse_mode="Markdown",
-        disable_web_page_preview=True,
-    )
+    """Alias for /start — shows full help text."""
+    await start(update, context)
 
 
 # ── Command handlers ──────────────────────────────────────────────────────────
 
-async def drops_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def drops(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /drops — fetch and display the latest Paras NFT drops.
+    /drops — Show the 5 most recent verified NFT drops on Paras marketplace.
     """
-    await update.message.reply_text("⏳ Fetching latest NEAR NFT drops from Paras…")
-
-    drops = await get_paras_drops()
-
-    if not drops:
-        await update.message.reply_text(
-            "😔 No drops found right now — please try again in a moment."
-        )
-        return
-
-    lines = ["🔥 *Latest NEAR NFT Drops on Paras*\n━━━━━━━━━━━━━━━━━━━━━\n"]
-    for i, d in enumerate(drops, 1):
-        price_near = (
-            f"{int(d['price']) / 1e24:.2f} NEAR"
-            if str(d["price"]).isdigit()
-            else str(d["price"])
-        )
-        start = d["start_date"][:10] if d.get("start_date") else "TBA"
-        end = d["end_date"][:10] if d.get("end_date") else "TBA"
-        lines.append(
-            f"*{i}. {d['title']}*\n"
-            f"  👤 Creator: `{d['creator_id']}`\n"
-            f"  💰 Price: {price_near}\n"
-            f"  🖼 Supply: {d['supply']}\n"
-            f"  📅 {start} → {end}\n"
-            f"  🔗 [View Drop]({d['url']})\n"
-        )
-
-    lines.append("━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("🌐 [Browse all drops](https://paras.id/drops)")
-
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
-        disable_web_page_preview=True,
-    )
-
-
-async def mintbase_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /mintbase — display recent Mintbase NFT store deployments.
-    """
-    await update.message.reply_text("⏳ Fetching recent Mintbase NFT stores…")
-
-    stores = await get_mintbase_recent_drops()
-
-    if not stores:
-        await update.message.reply_text(
-            "😔 Could not retrieve Mintbase stores right now — try again shortly."
-        )
-        return
-
-    lines = ["🏪 *Recent Mintbase NFT Stores*\n━━━━━━━━━━━━━━━━━━━━━\n"]
-    for i, s in enumerate(stores, 1):
-        created = s["created_at"][:10] if s.get("created_at") else "Unknown"
-        lines.append(
-            f"*{i}. {s['name']}*\n"
-            f"  📋 Contract: `{s['id']}`\n"
-            f"  👤 Owner: `{s['owner']}`\n"
-            f"  🖼 Minted: {s['minted']} tokens\n"
-            f"  📅 Created: {created}\n"
-            f"  🔗 [Open Store]({s['url']})\n"
-        )
-
-    lines.append("━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("🌐 [Explore Mintbase](https://mintbase.xyz)")
-
-    await update.message.reply_text(
-        "\n".join(lines),
-        parse_mode="Markdown",
-        disable_web_page_preview=True,
-    )
-
-
-async def nftinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /nftinfo <contract_id>
-    Fetch and display on-chain metadata for any NEP-171 NFT contract.
-    """
-    if not context.args:
-        await update.message.reply_text(
-            "⚠️ Usage: `/nftinfo <contract_id>`\n"
-            "_Example:_ `/nftinfo comic.paras.near`",
-            parse_mode="Markdown",
-        )
-        return
-
-    contract_id = context.args[0].strip()
-    await update.message.reply_text(
-        f"⏳ Looking up NFT contract `{contract_id}` on NEAR…",
-        parse_mode="Markdown",
-    )
-
+    await update.message.reply_text("🔍 Fetching latest Paras drops…")
     try:
-        meta = await get_nft_metadata(contract_id)
+        near_price = await get_near_price()
+        items = await get_paras_drops(limit=5)
+        if not items:
+            await update.message.reply_text("😕 No drops found right now. Try again later.")
+            return
+
+        lines = ["🎨 *Latest NFT Drops on Paras*\n"]
+        for i, drop in enumerate(items, 1):
+            price_str = (
+                f"{drop['floor_price']} NEAR"
+                f" (≈ ${round(drop['floor_price'] * near_price, 2)} USD)"
+                if drop["floor_price"] is not None
+                else "Price TBD"
+            )
+            lines.append(
+                f"*{i}. {drop['title']}*\n"
+                f"   👤 Creator: `{drop['creator_id']}`\n"
+                f"   💰 Floor: {price_str}\n"
+                f"   🔗 [View on Paras]({drop['url']})\n"
+            )
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
     except Exception as exc:
-        await update.message.reply_text(
-            f"❌ Error fetching metadata:\n`{exc}`\n\n"
-            "Make sure the contract ID is correct and implements NEP-171.",
-            parse_mode="Markdown",
-        )
-        return
-
-    name = meta.get("name", "N/A")
-    symbol = meta.get("symbol", "N/A")
-    spec = meta.get("spec", "N/A")
-    base_uri = meta.get("base_uri") or "_not set_"
-    reference = meta.get("reference") or "_not set_"
-    icon = "✅ present" if meta.get("icon") else "❌ not set"
-
-    text = (
-        f"🖼 *NFT Contract Metadata*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 Contract: `{contract_id}`\n"
-        f"🏷 Name: *{name}*\n"
-        f"🔤 Symbol: `{symbol}`\n"
-        f"📐 Spec: `{spec}`\n"
-        f"🌐 Base URI: {base_uri}\n"
-        f"📄 Reference: {reference}\n"
-        f"🖼 Icon: {icon}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔗 [View on NEAR Explorer](https://explorer.near.org/accounts/{contract_id})"
-    )
-    await update.message.reply_text(
-        text,
-        parse_mode="Markdown",
-        disable_web_page_preview=True,
-    )
+        logger.exception("drops error")
+        await update.message.reply_text(f"❌ Error fetching drops: {exc}")
 
 
-async def supply_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def mintbase_drops(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /supply <contract_id>
-    Fetch and display the total minted supply for an NFT contract.
+    /mintbase — Show 5 newest NFT stores/contracts deployed on Mintbase.
     """
-    if not context.args:
-        await update.message.reply_text(
-            "⚠️ Usage: `/supply <contract_id>`\n"
-            "_Example:_ `/supply x.paras.near`",
-            parse_mode="Markdown",
-        )
-        return
-
-    contract_id = context.args[0].strip()
-    await update.message.reply_text(
-        f"⏳ Fetching supply for `{contract_id}`…",
-        parse_mode="Markdown",
-    )
-
+    await update.message.reply_text("🔍 Fetching latest Mintbase stores…")
     try:
-        supply = await get_nft_supply(contract_id)
-        # Fetch name too for a nicer display
-        try:
-            meta = await get_nft_metadata(contract_id)
+        items = await get_mintbase_drops(limit=5)
+        if not items:
+            await update.message.reply_text("😕 No Mintbase drops found. Try again later.")
+            return
+
+        lines = ["🏪 *Latest Stores on Mintbase*\n"]
+        for i, store in enumerate(items, 1):
+            created = store["created_at"][:10] if store["created_at"] else "unknown"
+            lines.append(
+                f"*{i}. {store['name']}*\n"
+                f"   👤 Owner: `{store['owner_id']}`\n"
+                f"   📅 Created: {created}\n"
+                f"   🔗 [View on Mintbase]({store['url']})\n"
+            )
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        logger.exception("mintbase error")
+        await update.message.reply_text(f"❌ Error fetching Mintbase stores: {exc}")
+
+
+async def price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /price — Display the current NEAR token price in USD.
+    """
+    try:
+        usd = await get_near_price()
+        text = (
+            f"💰 *NEAR Token Price*\n\n"
+            f"  1 NEAR = *${usd:,.4f} USD*\n\n"
+            f"_Data sourced from CoinGecko_"
+        )
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception as exc:
+        logger.exception("price error")
+        await update.message.reply_text(f"❌ Could not fetch price: {exc}")
+
+
+async def chain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /chain — Display live NEAR blockchain stats (block height & timestamp).
+    """
+    try:
+        info = await get_near_block_info()
+        text = (
+            "⛓️ *NEAR Blockchain Status*\n\n"
+            f"  📦 Block Height: `{info['height']:,}`\n"
+            f"  🕐 Timestamp:    `{info['timestamp']}`\n"
+            f"  🔑 Block Hash:\n  `{info['hash']}`\n\n"
+            "_Fetched live from NEAR mainnet RPC_"
+        )
+        await update.message.reply_text(text, parse_mode="Markdown")
+    except Exception as exc:
+        logger.exception("chain error")
+        await update.message.reply_text(f"❌ Could not fetch chain info: {exc}")
+
+
+async def mynfts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /mynfts <account.near> <contract.near>
+    Show the first 10 NFTs owned by the given account on a specific contract.
+
+    Example:
+        /mynfts alice.near x.paras.near
+    """
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "⚠️ Usage: `/mynfts <account.near> <contract.near>`\n\n"
+            "Example:\n`/mynfts alice.near x.paras.near`",
+            parse_mode="Markdown",
+        )
+        return
+
+    account_id = context.args[0].strip()
+    contract_id = context.args[1].strip()
+
+    await update.message.reply_text(
+        f"🔍 Looking up NFTs for `{account_id}` on `{contract_id}`…",
+        parse_mode="Markdown",
+    )
+    try:
+        tokens = await get_account_nfts(account_id, contract_id)
+        if not tokens:
+            await update.message.reply_text(
+                f"😕 No NFTs found for `{account_id}` on `{contract_id}`.",
+                parse_mode="Markdown",
+            )
+            return
+
+        lines = [
+            f"🖼️ *NFTs owned by* `{account_id}`\n"
+            f"   _Contract: {contract_id}_\n"
+        ]
+        for i, tok in enumerate(tokens[:10], 1):
+            meta = tok.get("metadata", {})
+            token_id = tok.get("token_id", "?")
+            title = meta.get("title") or f"Token #{token_id}"
+            desc = (meta.get("description") or "")[:80]
+            lines.append(
+                f"*{i}. {title}*\n"
+                f"   🆔 ID: `{token_id}`\n"
+                + (f"   📝 {desc}\n" if desc else "")
+            )
+        await update.message.reply_text(
+            "\n".join(lines),
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+        )
+    except Exception as exc:
+        logger.exception("mynfts error")
+        await update.message.reply_text(
+            f"❌ Error fetching NFTs: {exc}\n\n"
+            "Make sure the contract supports `nft_tokens_for_owner` (NEP-171)."
+        )
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
@@ -455,10 +386,11 @@ def main() -> None:
     application = ApplicationBuilder().token(token).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("drops", drops_command))
-    application.add_handler(CommandHandler("mintbase", mintbase_command))
-    application.add_handler(CommandHandler("nftinfo", nftinfo_command))
-    application.add_handler(CommandHandler("supply", supply_command))
+    application.add_handler(CommandHandler("drops", drops))
+    application.add_handler(CommandHandler("mintbase_drops", mintbase_drops))
+    application.add_handler(CommandHandler("price", price))
+    application.add_handler(CommandHandler("chain", chain))
+    application.add_handler(CommandHandler("mynfts", mynfts))
     application.run_polling()
 
 if __name__ == "__main__":
