@@ -1,6 +1,6 @@
 # NEAR NFT Drop Alert Bot
 
-A Telegram bot that delivers real-time NFT drop alerts and NEAR ecosystem updates directly to your chat. Stay ahead of new mints, track prices, and explore your NEAR NFT portfolio without leaving Telegram.
+A Telegram bot that delivers real-time NFT drop alerts and information from the NEAR ecosystem. Stay updated on the latest mints, collections, and supply data from Mintbase and other NEAR marketplaces. Never miss a drop again.
 
 ---
 
@@ -8,14 +8,13 @@ A Telegram bot that delivers real-time NFT drop alerts and NEAR ecosystem update
 
 - Python 3.9+
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
-- A NEAR-compatible wallet address (optional, for portfolio features)
 
 ---
 
 ## Installation
 
-git clone https://github.com/your-username/near-nft-drop-bot.git
-cd near-nft-drop-bot
+git clone https://github.com/your-username/near-nft-drop-alert-bot.git
+cd near-nft-drop-alert-bot
 pip install -r requirements.txt
 
 ---
@@ -27,9 +26,13 @@ pip install -r requirements.txt
 3. Copy the token BotFather provides
 4. Set it as an environment variable:
 
-export BOT_TOKEN=your_token_here
+# Linux / macOS
+export BOT_TOKEN="your_token_here"
 
-Or create a `.env` file in the project root:
+# Windows
+set BOT_TOKEN=your_token_here
+
+Alternatively, create a `.env` file in the project root:
 
 BOT_TOKEN=your_token_here
 
@@ -39,8 +42,6 @@ BOT_TOKEN=your_token_here
 
 python bot.py
 
-The bot will start polling for updates. You should see a confirmation message in your terminal.
-
 ---
 
 ## Available Commands
@@ -49,28 +50,43 @@ The bot will start polling for updates. You should see a confirmation message in
 |---|---|
 | `/start` | Start the bot and see the welcome message |
 | `/help` | Show all available commands and usage info |
-| `/price` | Get the current NEAR token price |
-| `/drops` | View upcoming and live NFT drops on NEAR |
-| `/newstores` | Browse newly launched NFT stores and collections |
-| `/inspect` | Inspect a specific NFT or collection by ID |
-| `/mynfts` | View NFTs held in your connected NEAR wallet |
+| `/drops` | View the latest NFT drops on NEAR |
+| `/mintbase` | Browse trending Mintbase collections |
+| `/nftinfo` | Get detailed info about a specific NFT or collection |
+| `/supply` | Check current token supply stats |
 
 ---
 
 ## Deployment
 
-For production deployment, a `Procfile` is included. Deploy in one command using Railway or Heroku:
+**Railway (recommended):**
 
-# Railway
-railway up
+Push to GitHub and connect your repo at [railway.app](https://railway.app). Add `BOT_TOKEN` as an environment variable in the Railway dashboard.
 
-# Heroku
-heroku create && git push heroku main
+**Heroku:**
 
-Make sure to set `BOT_TOKEN` as an environment variable in your platform's dashboard before deploying.
+echo "worker: python bot.py" > Procfile
+git push heroku main
+heroku config:set BOT_TOKEN=your_token_here
+
+---
+
+## Project Structure
+
+near-nft-drop-alert-bot/
+├── bot.py
+├── requirements.txt
+├── Procfile
+└── .env.example
+
+---
+
+## Contributing
+
+Pull requests are welcome. For major changes, open an issue first to discuss what you would like to change.
 
 ---
 
 ## License
 
-MIT
+[MIT](LICENSE)
